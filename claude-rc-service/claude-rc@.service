@@ -1,0 +1,24 @@
+# 작업 디렉터리마다 Claude Code Remote Control 서버를 하나씩 상시 띄운다.
+#   인스턴스 이름 = 서버 이름 접미사   claude-rc@snacks → 서버 dev-snacks
+#   작업 디렉터리 = ~/.config/claude-rc/{인스턴스}.env 의 WORKDIR
+# 서버 추가: env 파일 하나 만들고 systemctl --user enable --now claude-rc@{이름}
+#   (그 디렉터리에서 `claude`를 한 번 실행해 workspace trust를 수락해 둬야 한다)
+# 점검: systemctl --user status 'claude-rc@*' / journalctl --user -u claude-rc@snacks -f
+
+[Unit]
+Description=Claude Code Remote Control server (%i)
+Documentation=https://code.claude.com/docs/en/remote-control
+# 부팅 직후 네트워크가 늦어도 계속 재시도한다. 시도 제한을 걸면 그런 날 영구 정지한다.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/claude-rc/%i.env
+# fish를 거쳐 tmux 시절과 같은 환경(PATH, nvm Node 22)을 물려준다. $$ 는 fish가 변수를 풀게 한다.
+ExecStart=/usr/bin/fish -c 'cd $$WORKDIR; and exec %h/.local/bin/claude remote-control --name dev-%i --remote-control-session-name-prefix dev-%i --permission-mode auto'
+# 네트워크 약 10분 단절 시 서버가 스스로 종료하므로 종료 코드와 무관하게 다시 띄운다.
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
