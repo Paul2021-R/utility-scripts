@@ -1,0 +1,587 @@
+#!/usr/bin/env bash
+# claude-snap — Claude Code 원격 제어 세션 장부 · 부팅 복구
+#
+#   save [--final]                   살아 있는 원격 제어 세션을 장부에 반영한다 (5분 타이머 / 종료 직전)
+#   restore [--from FILE] [--dry-run]
+#                                    장부(또는 FILE)의 세션을 tmux 창마다 `claude --resume` 으로 띄우고
+#                                    원격 연결까지 됐는지 검증한다. FILE 의 항목은 장부에 합친다
+#   status [FILE]                    장부(또는 FILE)의 항목과 현재 상태
+#   add <세션ID>...                  대화 기록(jsonl)으로 항목을 만들어 장부에 넣는다 (ID 앞부분만 줘도 된다)
+#   drop <세션ID>...                 장부에서 뺀다
+#   history                          장부 변경 이력
+#
+# 장부 규칙 — 항목은 "끝났다는 증거"가 있을 때만 빠진다.
+#   · 이번 부팅에 연결을 확인한 세션의 원격 연결이 null 이 됨 (claude.ai / 앱에서 보관)
+#   · 이번 부팅에 살아 있던 세션이 켜져 있는 동안 사라짐 (/exit · 서버 세션 보관)
+#   · 대화 기록(jsonl)이 없음
+# 이번 부팅에 아직 보이지 않은 항목(복구 전 · 복구 실패 · 서버가 맡은 채 대기 중)은 남는다.
+
+set -uo pipefail
+# ⚠️ pipefail 아래에서 `… | grep -q` 를 쓰지 않는다. grep -q 가 먼저 끝나면 앞 명령이 SIGPIPE 로
+#    141 을 내고, 찾았는데도 실패로 판정된다. 찾기만 할 때는 `grep … > /dev/null` 로 끝까지 읽는다.
+
+export PATH="$HOME/.local/bin:$PATH"
+
+SESSIONS_DIR="$HOME/.claude/sessions"
+PROJECTS_DIR="$HOME/.claude/projects"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-snap"
+LEDGER="$STATE_DIR/ledger.json"
+HISTORY_DIR="$STATE_DIR/history"
+REPORT_DIR="$STATE_DIR/reports"
+EVENTS="$STATE_DIR/events.log"
+
+HISTORY_KEEP=50
+REPORT_KEEP=30
+NET_WAIT_SEC=120
+SERVER_WAIT_SEC=150    # 서버 재시작 간격(30s) + 연결 + 목록 안정
+SERVER_SETTLE_SEC=10
+VERIFY_WAIT_SEC=90
+RESTORED_TMUX_SESSION="claude-restored"   # tmux 밖에서 떠 있던 세션이 복구될 자리
+
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
+FISH="$(command -v fish)"
+REPORT=""
+
+log() {
+    echo "[$1] ${*:2}"
+    [[ -n "$REPORT" ]] && printf '%s [%s] %s\n' "$(date +%T)" "$1" "${*:2}" >> "$REPORT"
+    return 0
+}
+event() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$EVENTS"; }
+now() { date +%s; }
+
+mkdir -p "$STATE_DIR" "$HISTORY_DIR" "$REPORT_DIR"
+
+# 이전 판(snapshot.json)에서 한 번만 옮겨 온다.
+if [[ ! -f "$LEDGER" && -f "$STATE_DIR/snapshot.json" ]]; then
+    mv "$STATE_DIR/snapshot.json" "$LEDGER"
+    [[ -f "$STATE_DIR/snapshot.json.prev" ]] && mv "$STATE_DIR/snapshot.json.prev" "$HISTORY_DIR/ledger-migrated-prev.json"
+    rm -f "$STATE_DIR/restored-boot"
+    event "MIGRATE snapshot.json → ledger.json"
+fi
+
+exec 9>"$STATE_DIR/lock"
+take_lock() {
+    flock -w 30 9 && return 0
+    log SKIP "다른 claude-snap 이 잠금을 쥐고 있다 (복구가 진행 중일 수 있다)"
+    return 1
+}
+
+
+# ── 장부 입출력 ──────────────────────────────────────────
+
+load_ledger() {
+    if [[ -f "$LEDGER" ]]; then cat "$LEDGER"; else echo '{"entries":[]}'; fi
+}
+
+# 항목 구성이 바뀔 때만 직전 판을 history 에 남긴다. lastSeen 같은 갱신은 이력으로 치지 않는다.
+write_ledger() {
+    local new="$1" cur old_key new_key tmp
+    cur="$(load_ledger)"
+    old_key="$(jq -c '[.entries[] | del(.lastSeen)] | sort_by(.sessionId)' <<< "$cur")"
+    new_key="$(jq -c '[.entries[] | del(.lastSeen)] | sort_by(.sessionId)' <<< "$new")"
+    if [[ -f "$LEDGER" && "$old_key" != "$new_key" ]]; then
+        cp -f "$LEDGER" "$HISTORY_DIR/ledger-$(date +%Y%m%d-%H%M%S-%3N).json"
+        ls -1t "$HISTORY_DIR"/ledger-*.json 2>/dev/null | tail -n +$((HISTORY_KEEP + 1)) | xargs -r rm -f
+    fi
+    tmp="$(mktemp "$STATE_DIR/.ledger.XXXXXX")"
+    jq --argjson t "$(now)" '. + {updatedAt: $t, updatedAtIso: ($t | strflocaltime("%Y-%m-%dT%H:%M:%S%z"))}' <<< "$new" > "$tmp" \
+        && mv -f "$tmp" "$LEDGER" || { rm -f "$tmp"; log ERROR "장부를 쓰지 못했다"; return 1; }
+}
+
+jsonl_of() { compgen -G "$PROJECTS_DIR/*/$1.jsonl" | head -1; }
+
+
+# ── 살아 있는 세션 수집 ──────────────────────────────────
+
+# /proc/<pid>/stat 의 starttime(22번째 필드). sessions/*.json 의 procStart 와 대조해 pid 재사용을 걸러낸다.
+proc_start() {
+    local stat
+    stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+    stat="${stat##*) }"
+    local -a f
+    read -ra f <<< "$stat"
+    echo "${f[19]}"
+}
+
+# 실행 옵션 중 복구 때 다시 붙일 것만 골라 JSON 배열로 낸다.
+# 서버가 띄운 세션의 --sdk-url · --resume=URL 같은 내부 인자는 목록에 없으므로 빠진다.
+extract_args() {
+    local pid="$1" a v i
+    local -a argv out=()
+    mapfile -d '' argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+    for ((i = 1; i < ${#argv[@]}; i++)); do
+        a="${argv[i]}"
+        case "$a" in
+            --model|--effort|--permission-mode|--name|-n|--agent)
+                ((i + 1 < ${#argv[@]})) || continue
+                out+=("$a" "${argv[i+1]}"); ((i++)) ;;
+            --add-dir)
+                out+=("$a")
+                while ((i + 1 < ${#argv[@]})) && [[ "${argv[i+1]}" != -* ]]; do
+                    out+=("${argv[i+1]}"); ((i++))
+                done ;;
+            --remote-control)
+                out+=("$a")
+                v="${argv[i+1]:-}"
+                if [[ -n "$v" && "$v" != -* ]]; then out+=("$v"); ((i++)); fi ;;
+            --model=*|--effort=*|--permission-mode=*|--name=*|--agent=*|--add-dir=*|--remote-control=*)
+                out+=("$a") ;;
+            --dangerously-skip-permissions|--chrome|--no-chrome)
+                out+=("$a") ;;
+        esac
+    done
+    if ((${#out[@]})); then printf '%s\n' "${out[@]}" | jq -R . | jq -sc .; else echo '[]'; fi
+}
+
+# 실행 중에 shift+tab 등으로 바꾼 권한 모드는 명령줄에 없고 대화 기록에만 남는다.
+jsonl_permission_mode() {
+    grep -h '"type":"permission-mode"' "$1" 2>/dev/null | tail -1 | jq -r '.permissionMode // empty' 2>/dev/null
+}
+
+is_server_child() {
+    tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | grep -x -- '--sdk-url' > /dev/null
+}
+
+# 지금 살아 있는 세션 전부(원격 제어 여부 무관)를 JSON 배열로 낸다.
+collect_live() {
+    local f pid start args origin jl perm used
+    local -a items=()
+    shopt -s nullglob
+    for f in "$SESSIONS_DIR"/*.json; do
+        pid="$(jq -r '.pid // empty' "$f" 2>/dev/null)"
+        [[ -n "$pid" ]] || continue
+        start="$(proc_start "$pid")" || continue
+        [[ "$start" == "$(jq -r '.procStart // empty' "$f")" ]] || continue
+        args="$(extract_args "$pid")" || args='[]'
+        if is_server_child "$pid"; then origin=server; else origin=local; fi
+        jl="$(jsonl_of "$(jq -r '.sessionId' "$f")")"
+        used=false
+        if [[ -n "$jl" ]]; then
+            grep -q '"type":"user"' "$jl" && used=true
+            if ! jq -e 'index("--permission-mode") or any(.[]; startswith("--permission-mode="))' <<< "$args" > /dev/null; then
+                perm="$(jsonl_permission_mode "$jl")"
+                [[ -n "$perm" ]] && args="$(jq -c --arg p "$perm" '. + ["--permission-mode", $p]' <<< "$args")"
+            fi
+        fi
+        items+=("$(jq -c --argjson args "$args" --arg origin "$origin" --argjson used "$used" '{
+            sessionId, cwd, name, nameSource, bridgeSessionId, pid,
+            origin: $origin, used: $used,
+            tmuxSession: (if .tmux then (.tmux | split(":")[0]) else null end),
+            args: $args
+        }' "$f")")
+    done
+    if ((${#items[@]})); then printf '%s\n' "${items[@]}" | jq -sc .; else echo '[]'; fi
+}
+
+
+# ── save ────────────────────────────────────────────────
+
+cmd_save() {
+    local final=0
+    [[ "${1:-}" == "--final" ]] && final=1
+    take_lock || return 0
+
+    local live cur nojsonl='[]' id result
+    live="$(collect_live)"
+    cur="$(load_ledger)"
+
+    # 같은 대화를 프로세스 둘이 잡고 있으면 알린다. 장부는 그중 하나만 반영한다.
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        log WARN "$id 를 프로세스 여럿이 잡고 있다 — 앱에서 중복 항목 하나를 보관한다"
+        grep -F "DUP-LIVE $id" "$EVENTS" > /dev/null 2>&1 || event "DUP-LIVE $id $(jq -r --arg i "$id" '[.[] | select(.sessionId == $i) | "\(.pid):\(.bridgeSessionId)"] | join(" ")' <<< "$live")"
+    done < <(jq -r '[.[].sessionId] | group_by(.) | map(select(length > 1) | .[0]) | .[]' <<< "$live")
+
+    while IFS= read -r id; do
+        [[ -n "$id" && -z "$(jsonl_of "$id")" ]] && nojsonl="$(jq -c --arg i "$id" '. + [$i]' <<< "$nojsonl")"
+    done < <(jq -r '.entries[].sessionId' <<< "$cur")
+
+    result="$(jq -c --argjson live "$live" --arg boot "$BOOT_ID" --argjson now "$(now)" \
+        --argjson final "$final" --argjson nojsonl "$nojsonl" '
+        ($live | map({key: .sessionId, value: .}) | from_entries) as $L
+        | (.entries | map(.sessionId)) as $known
+        | [ .entries[] | . as $e | $L[$e.sessionId] as $l
+            | if ($nojsonl | index($e.sessionId)) then {drop: "no-transcript", e: $e}
+              elif $l then
+                if $l.bridgeSessionId then
+                  {e: ($e + ($l | del(.pid, .used)) + {lastSeen: $now, lastSeenBoot: $boot, restoreFails: 0, lastRestoreError: null})}
+                elif $e.lastSeenBoot == $boot then {drop: "archived", e: $e}
+                else {e: $e} end
+              elif ($final == 0 and $e.lastSeenBoot == $boot) then {drop: "ended", e: $e}
+              else {e: $e} end
+          ] as $decided
+        | [ $live[] | select(.bridgeSessionId != null and .used and (.sessionId as $i | $known | index($i) | not))
+            | del(.pid, .used) + {firstSeen: $now, lastSeen: $now, lastSeenBoot: $boot, restoreFails: 0, lastRestoreError: null} ] as $added
+        | { entries: ([$decided[] | select(.drop | not) | .e] + $added),
+            dropped: [$decided[] | select(.drop) | {id: .e.sessionId, name: .e.name, reason: .drop}],
+            added: [$added[] | {id: .sessionId, name}] }
+    ' <<< "$cur")" || { log ERROR "장부 계산 실패"; return 1; }
+
+    write_ledger "$(jq -c '{entries}' <<< "$result")" || return 1
+
+    local d
+    while IFS= read -r d; do event "ADD  $d"; done < <(jq -r '.added[] | "\(.id) \(.name // "")"' <<< "$result")
+    while IFS= read -r d; do event "DROP $d"; log DROP "$d"; done < <(jq -r '.dropped[] | "\(.id) \(.reason) \(.name // "")"' <<< "$result")
+
+    log SAVE "$( ((final)) && echo '[final] ')장부 $(jq '.entries | length' <<< "$result")개 · 추가 $(jq '.added | length' <<< "$result") · 제외 $(jq '.dropped | length' <<< "$result") · 살아 있는 세션 $(jq 'length' <<< "$live")개"
+}
+
+
+# ── restore ─────────────────────────────────────────────
+
+wait_network() {
+    local i
+    for ((i = 0; i < NET_WAIT_SEC; i += 5)); do
+        curl -s -o /dev/null --max-time 5 https://api.anthropic.com/ && return 0
+        sleep 5
+    done
+    log WARN "네트워크 대기 ${NET_WAIT_SEC}s 초과 — 그대로 진행한다"
+}
+
+# 원격 제어 서버(claude-rc@*)의 화면 출력. 서버 TUI 는 상태가 바뀔 때만 화면을 다시 그리므로
+# 시간 창이 아니라 이번 기동 이후 출력 전체에서 마지막 화면을 찾는다.
+# 부팅 직후 네트워크가 늦으면 서버가 한 번 실패하고 30초 뒤 재시작(activating/auto-restart)하므로
+# active 만 보면 그 서버를 통째로 놓친다.
+rc_units() {
+    systemctl --user list-units 'claude-rc@*' --all --plain --no-legend 2>/dev/null \
+        | awk '$3 == "active" || $3 == "activating" {print $1}'
+}
+rc_output() {
+    local since
+    since="$(systemctl --user show -p ExecMainStartTimestamp --value "$1" | awk '{print $2" "$3}')"
+    [[ -n "$since" ]] || return 0
+    journalctl --user -u "$1" --since "$since" -o cat 2>/dev/null
+}
+
+# 서버마다 연결(Connected)된 뒤 세션 목록이 SERVER_SETTLE_SEC 동안 바뀌지 않을 때까지 기다린다.
+# 서버는 연결 직후 빈 목록(Capacity 0)을 먼저 그리고, 이전 세션을 1~2초 뒤에 되살려 다시 그린다.
+wait_servers() {
+    local u i ok cur prev="" stable=0
+    local -a units
+    mapfile -t units < <(rc_units)
+    ((${#units[@]})) || return 0
+    for ((i = 0; i < SERVER_WAIT_SEC; i += 2)); do
+        ok=1
+        for u in "${units[@]}"; do
+            rc_output "$u" | grep 'Connected' > /dev/null || { ok=0; break; }
+        done
+        if ((ok)); then
+            cur="$(server_listed | tr '\n' ' ')"
+            if [[ "$cur" == "$prev" ]]; then ((stable += 2)); else stable=0; prev="$cur"; fi
+            if ((stable >= SERVER_SETTLE_SEC)); then
+                log INFO "서버 ${#units[@]}개 연결 · 목록 안정 ($((i))s)"
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    log WARN "서버 대기 ${SERVER_WAIT_SEC}s 초과 — 서버가 맡은 세션을 확인하지 못한 채 진행한다"
+}
+
+# 서버들이 지금 맡고 있는 원격 세션 ID (session_...). 각 서버의 마지막 화면
+# (마지막 `Capacity:` 줄부터 안내 문구 전까지)에 적힌 세션 링크를 읽는다.
+server_listed() {
+    local u
+    for u in $(rc_units); do
+        rc_output "$u" | awk '
+            /Capacity:/ { buf = ""; cap = 1; next }
+            cap && /(Continue coding|Code anywhere)/ { last = buf; cap = 0; next }
+            cap { buf = buf "\n" $0 }
+            END { print (cap ? buf : last) }'
+    done | grep -oE 'code/session_[A-Za-z0-9]+' | sed 's#^code/##' | sort -u
+}
+
+# 복구가 띄우는 tmux 서버는 자기 스코프에 둔다. 호출한 쪽(서비스 · claude-rc 세션 안의 Claude)의
+# cgroup 에 들어가면 그쪽이 멈추거나 재시작될 때 복구된 세션이 전부 함께 죽는다.
+launch() {
+    local ts="$1" wn="$2" cwd="$3"
+    shift 3
+    # fish 를 거쳐야 config.fish 가 채우는 PATH·nvm Node 가 세션에 물려진다.
+    # `--` 가 없으면 fish 가 --resume 같은 인자를 자기 옵션으로 읽고 바로 종료한다.
+    # 종료 표시는 실패 화면을 잘라 올 기준점이다. 이어지는 fish 시작 화면(fastfetch 등)이 오류를 밀어낸다.
+    local -a cmd=("$FISH" -c 'claude $argv; echo "[claude-snap] claude 종료 (코드 $status)"; exec fish' -- "$@")
+    # 9>&- : tmux 서버가 잠금 fd 를 물려받으면 서버가 사는 동안 잠금이 풀리지 않는다.
+    if ! tmux list-sessions > /dev/null 2>&1; then
+        systemd-run --user --scope --quiet --collect --unit="claude-snap-tmux-$(date +%s%N)" \
+            tmux new-session -d -P -F '#{pane_id}' -s "$ts" -n "$wn" -c "$cwd" "${cmd[@]}" 9>&-
+    elif tmux has-session -t "=$ts" 2>/dev/null; then
+        tmux new-window -d -P -F '#{pane_id}' -t "=$ts:" -n "$wn" -c "$cwd" "${cmd[@]}" 9>&-
+    else
+        tmux new-session -d -P -F '#{pane_id}' -s "$ts" -n "$wn" -c "$cwd" "${cmd[@]}" 9>&-
+    fi
+}
+
+pane_text() { tmux capture-pane -p -J -S -500 -t "$1" 2>/dev/null | grep -v '^\s*$'; }
+pane_exited() { pane_text "$1" | grep '^\[claude-snap\] claude 종료' > /dev/null; }
+
+# 실패한 창에서 원인이 보이는 부분 — claude 가 끝났으면 종료 표시 앞 15줄, 아니면 현재 화면 끝 15줄.
+pane_failure() {
+    local t
+    t="$(pane_text "$1")"
+    if grep '^\[claude-snap\] claude 종료' <<< "$t" > /dev/null; then
+        awk '/^\[claude-snap\] claude 종료/ { for (i = NR - 15; i < NR; i++) if (i > 0) print L[i]; print; exit } { L[NR] = $0 }' <<< "$t"
+    else
+        tail -15 <<< "$t"
+    fi
+}
+
+# 띄운 세션이 원격 제어까지 연결됐는지 본다.
+check_connected() {
+    local id="$1" f pid
+    shopt -s nullglob
+    for f in "$SESSIONS_DIR"/*.json; do
+        [[ "$(jq -r '.sessionId' "$f" 2>/dev/null)" == "$id" ]] || continue
+        pid="$(jq -r '.pid' "$f")"
+        [[ -d "/proc/$pid" ]] || continue
+        [[ "$(jq -r '.bridgeSessionId // empty' "$f")" == session_* ]] && return 0
+    done
+    return 1
+}
+
+cmd_restore() {
+    local from="" dry=0
+    while (($#)); do
+        case "$1" in
+            --from)    from="${2:-}"; shift 2 ;;
+            --dry-run) dry=1; shift ;;
+            *) log ERROR "알 수 없는 인자: $1"; return 2 ;;
+        esac
+    done
+    take_lock || return 1
+
+    ((dry)) || {
+        REPORT="$REPORT_DIR/restore-$(date +%Y%m%d-%H%M%S).log"
+        ls -1t "$REPORT_DIR"/restore-*.log 2>/dev/null | tail -n +$((REPORT_KEEP)) | xargs -r rm -f
+        log INFO "boot $BOOT_ID · 원본 ${from:-$LEDGER}"
+    }
+
+    local src
+    if [[ -n "$from" ]]; then
+        [[ -f "$from" ]] || { log ERROR "파일이 없다: $from"; return 1; }
+        src="$(jq -c '{entries: (.entries // [])}' "$from")" || { log ERROR "장부 형식이 아니다: $from"; return 1; }
+        if ((!dry)); then
+            local merged
+            merged="$(jq -c --argjson add "$src" '
+                (.entries | map(.sessionId)) as $k
+                | .entries += [$add.entries[] | select(.sessionId as $i | $k | index($i) | not)]' <<< "$(load_ledger)")"
+            write_ledger "$merged" || return 1
+            event "IMPORT $from ($(jq '.entries | length' <<< "$src")개)"
+        fi
+    else
+        src="$(load_ledger)"
+    fi
+
+    local n
+    n="$(jq '.entries | length' <<< "$src")"
+    ((n)) || { log INFO "복구할 항목이 없다"; return 0; }
+
+    if ((!dry)); then wait_network; wait_servers; fi
+
+    local live_ids served
+    live_ids="$(collect_live | jq -r '.[].sessionId')"
+    served="$(server_listed)"
+    log INFO "항목 ${n}개 · 서버가 맡은 세션 $(grep -c . <<< "$served")개"
+
+    local e id cwd ts name nsrc bridge pane
+    local -a args launched=()
+    local -A pane_of=() bridge_of=() errors=()
+    local n_skip=0
+    while IFS= read -r e; do
+        id="$(jq -r '.sessionId' <<< "$e")"
+        cwd="$(jq -r '.cwd' <<< "$e")"
+        ts="$(jq -r '.tmuxSession // empty' <<< "$e")"
+        name="$(jq -r '.name // empty' <<< "$e")"
+        nsrc="$(jq -r '.nameSource // empty' <<< "$e")"
+        bridge="$(jq -r '.bridgeSessionId // empty' <<< "$e")"
+        mapfile -t args < <(jq -r '.args[]?' <<< "$e")
+
+        if grep -qxF -- "$id" <<< "$live_ids"; then
+            log SKIP "$id ${name:+($name) }이미 떠 있다"; ((n_skip++)); continue
+        fi
+        if [[ ! -d "$cwd" ]]; then
+            log FAIL "$id 작업 디렉터리 없음: $cwd"; errors[$id]="no-cwd"; continue
+        fi
+        if [[ -z "$(jsonl_of "$id")" ]]; then
+            log FAIL "$id 대화 기록(jsonl) 없음"; errors[$id]="no-transcript"; continue
+        fi
+        if [[ -n "$bridge" ]] && grep -qxF -- "$bridge" <<< "$served"; then
+            log SKIP "$id ${name:+($name) }서버가 $bridge 를 맡고 있다"; ((n_skip++)); continue
+        fi
+
+        # 원격 제어를 /remote-control 로 켰거나 서버가 띄운 세션이면 플래그가 없다.
+        if ! printf '%s\n' "${args[@]}" | grep -- '^--remote-control' > /dev/null; then
+            args+=(--remote-control)
+            [[ -n "$name" && "$nsrc" != derived ]] && args+=("$name")
+        fi
+        [[ -n "$ts" ]] || ts="$RESTORED_TMUX_SESSION"
+
+        if ((dry)); then
+            log DRY "tmux[$ts] $cwd :: claude --resume $id ${args[*]}"
+            continue
+        fi
+        if pane="$(launch "$ts" "${name:-${id:0:8}}" "$cwd" --resume "$id" "${args[@]}")"; then
+            log START "tmux[$ts] $id ${name:+($name)}"
+            launched+=("$id"); pane_of[$id]="$pane"; bridge_of[$id]="$bridge"
+        else
+            log FAIL "$id tmux 기동 실패"; errors[$id]="tmux"
+        fi
+    done < <(jq -c '.entries[]' <<< "$src")
+
+    ((dry)) && return 0
+
+    # 검증 — 원격 연결까지 확인되면 성공. claude 가 끝나 버렸거나 제한 시간까지 연결이 안 되면
+    # 그 창의 화면을 리포트에 남긴다.
+    local -a pending=("${launched[@]}")
+    local -a exited=()
+    local waited=0 still
+    while ((${#pending[@]})) && ((waited < VERIFY_WAIT_SEC)); do
+        sleep 5; ((waited += 5))
+        still=()
+        for id in "${pending[@]}"; do
+            if check_connected "$id"; then continue; fi
+            if pane_exited "${pane_of[$id]}"; then exited+=("$id"); else still+=("$id"); fi
+        done
+        pending=("${still[@]}")
+    done
+    local n_ok=$((${#launched[@]} - ${#pending[@]} - ${#exited[@]}))
+    for id in "${exited[@]}"; do
+        log FAIL "$id claude 가 바로 종료됐다 — 창 화면:"
+        pane_failure "${pane_of[$id]}" | sed 's/^/        | /' | tee -a "$REPORT"
+        errors[$id]="exited"
+    done
+    for id in "${pending[@]}"; do
+        log FAIL "$id ${VERIFY_WAIT_SEC}s 안에 원격 연결 안 됨 — 창 화면:"
+        pane_failure "${pane_of[$id]}" | sed 's/^/        | /' | tee -a "$REPORT"
+        errors[$id]="not-connected"
+    done
+
+    # 복구한 뒤에 서버가 같은 세션을 뒤늦게 되살렸는지 본다. 그러면 한 대화를 프로세스 둘이 잡는다.
+    local served_after b
+    served_after="$(server_listed)"
+    for id in "${launched[@]}"; do
+        b="${bridge_of[$id]}"
+        if [[ -n "$b" ]] && grep -qxF -- "$b" <<< "$served_after"; then
+            log WARN "$id 중복 — 서버가 $b 도 되살렸다. 둘 중 하나를 앱에서 보관한다"
+            event "DUP  $id server=$b"
+        fi
+    done
+
+    # 실패 사유를 장부에 남긴다.
+    if ((${#errors[@]})); then
+        local errjson='{}'
+        for id in "${!errors[@]}"; do
+            errjson="$(jq -c --arg i "$id" --arg r "${errors[$id]}" '. + {($i): $r}' <<< "$errjson")"
+        done
+        write_ledger "$(jq -c --argjson er "$errjson" --arg rep "$REPORT" '
+            .entries |= map(if $er[.sessionId] then
+                .restoreFails = ((.restoreFails // 0) + 1) | .lastRestoreError = "\($er[.sessionId]) · \($rep | split("/") | last)"
+              else . end)' <<< "$(load_ledger)")"
+    fi
+
+    log INFO "복구 ${n_ok}개 · 실패 ${#errors[@]}개 · 건너뜀 ${n_skip}개 · 리포트 $REPORT"
+}
+
+
+# ── 장부 손질 ───────────────────────────────────────────
+
+# ID 앞부분으로 장부 항목 하나를 찾는다.
+resolve_in_ledger() {
+    local m
+    m="$(jq -r --arg p "$1" '[.entries[].sessionId | select(startswith($p))] | .[]' <<< "$(load_ledger)")"
+    [[ "$(grep -c . <<< "$m")" == 1 ]] && { echo "$m"; return 0; }
+    [[ -z "$m" ]] && log ERROR "장부에 $1 로 시작하는 항목이 없다" || log ERROR "$1 가 여러 항목에 걸린다: $(tr '\n' ' ' <<< "$m")"
+    return 1
+}
+
+cmd_drop() {
+    (($#)) || { log ERROR "뺄 세션 ID 를 준다"; return 2; }
+    take_lock || return 1
+    local p id
+    for p in "$@"; do
+        id="$(resolve_in_ledger "$p")" || continue
+        write_ledger "$(jq -c --arg i "$id" '.entries |= map(select(.sessionId != $i))' <<< "$(load_ledger)")" || return 1
+        event "DROP $id manual"
+        log DROP "$id"
+    done
+}
+
+cmd_add() {
+    (($#)) || { log ERROR "넣을 세션 ID 를 준다"; return 2; }
+    take_lock || return 1
+    local p jl id cwd perm model effort title bridge entry
+    local -a matches
+    for p in "$@"; do
+        mapfile -t matches < <(compgen -G "$PROJECTS_DIR/*/${p}*.jsonl")
+        if ((${#matches[@]} != 1)); then
+            log ERROR "$p: 대화 기록이 ${#matches[@]}개 걸린다"; continue
+        fi
+        jl="${matches[0]}"; id="$(basename "$jl" .jsonl)"
+        if jq -e --arg i "$id" '.entries | any(.sessionId == $i)' <<< "$(load_ledger)" > /dev/null; then
+            log SKIP "$id 이미 장부에 있다"; continue
+        fi
+        cwd="$(grep -h '"cwd":' "$jl" | tail -1 | jq -r '.cwd // empty')"
+        perm="$(jsonl_permission_mode "$jl")"
+        model="$(grep -h '"type":"assistant"' "$jl" | jq -r '.message.model // empty' | grep '^claude-' | tail -1)"
+        effort="$(grep -h '"type":"assistant"' "$jl" | jq -r '.effort // empty' | tail -1)"
+        title="$(grep -h '"type":"custom-title"' "$jl" | tail -1 | jq -r '.customTitle // empty')"
+        bridge="$(grep -h '"type":"bridge-session"' "$jl" | tail -1 | jq -r '.bridgeSessionId // empty' | sed 's/^cse_/session_/')"
+        [[ -n "$cwd" ]] || { log ERROR "$id: 대화 기록에서 작업 디렉터리를 찾지 못했다"; continue; }
+        entry="$(jq -nc --arg id "$id" --arg cwd "$cwd" --arg perm "$perm" --arg model "$model" --arg effort "$effort" \
+            --arg title "$title" --arg bridge "$bridge" --argjson now "$(now)" '{
+            sessionId: $id, cwd: $cwd,
+            name: (if $title == "" then null else $title end),
+            nameSource: (if $title == "" then "derived" else "user" end),
+            bridgeSessionId: (if $bridge == "" then null else $bridge end),
+            origin: "manual", tmuxSession: null,
+            args: ([if $perm != "" then ("--permission-mode", $perm) else empty end]
+                 + [if $model != "" then ("--model", $model) else empty end]
+                 + [if $effort != "" then ("--effort", $effort) else empty end]),
+            firstSeen: $now, lastSeen: null, lastSeenBoot: null, restoreFails: 0, lastRestoreError: null }')"
+        write_ledger "$(jq -c --argjson e "$entry" '.entries += [$e]' <<< "$(load_ledger)")" || return 1
+        event "ADD  $id manual"
+        log ADD "$id $cwd $(jq -r '.args | join(" ")' <<< "$entry")"
+    done
+}
+
+
+# ── 조회 ────────────────────────────────────────────────
+
+cmd_status() {
+    local file="${1:-$LEDGER}" live
+    [[ -f "$file" ]] || { echo "장부 없음 ($file)"; return 0; }
+    live="$(collect_live)"
+    echo "장부: $file · 갱신 $(jq -r '.updatedAtIso // .savedAtIso // "-"' "$file")"
+    jq -r --argjson live "$live" --arg boot "$BOOT_ID" '
+        ($live | map({(.sessionId): .}) | add // {}) as $L
+        | .entries[]
+        | [ (if $L[.sessionId] then (if $L[.sessionId].bridgeSessionId then "live" else "연결끊김" end)
+             elif .lastSeenBoot == $boot then "?" else "대기" end),
+            .origin, (.tmuxSession // "-"), .sessionId[0:8], (.cwd | split("/") | last),
+            ((.name // "") | .[0:30]),
+            (if .lastSeen then (.lastSeen | strflocaltime("%m-%d %H:%M")) else "-" end),
+            ((.restoreFails // 0) | tostring), (.lastRestoreError // "-") ]
+        | @tsv
+    ' "$file" | column -t -s $'\t' -N '상태,출신,tmux,세션,디렉터리,이름,마지막확인,실패,마지막오류'
+}
+
+cmd_history() {
+    local f
+    for f in $(ls -1t "$HISTORY_DIR"/ledger-*.json 2>/dev/null); do
+        printf '%s  %2s개  %s\n' "$(basename "$f")" "$(jq '.entries | length' "$f")" \
+            "$(jq -r '[.entries[].sessionId[0:8]] | join(" ")' "$f")"
+    done
+}
+
+
+case "${1:-}" in
+    save)    shift; cmd_save "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    add)     shift; cmd_add "$@" ;;
+    drop)    shift; cmd_drop "$@" ;;
+    history) cmd_history ;;
+    *)
+        sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+        exit 2 ;;
+esac

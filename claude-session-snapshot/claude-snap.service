@@ -1,0 +1,20 @@
+# Claude Code 원격 제어 세션 — 부팅 시 복구(ExecStart), 종료 직전 최종 저장(ExecStop)
+# 점검: claude-snap status / journalctl --user -u claude-snap -u claude-snap-save
+
+[Unit]
+Description=Claude Code session snapshot (restore on boot, final save on shutdown)
+After=claude-rc@obsidian.service claude-rc@snacks.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/claude-snap restore
+ExecStop=%h/.local/bin/claude-snap save --final
+# 복구가 띄운 tmux 서버는 이 유닛의 cgroup 에 남는다. process 로 두어야 유닛을
+# 멈추거나 재시작할 때 복구된 세션까지 함께 죽지 않는다.
+KillMode=process
+TimeoutStartSec=10min
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
