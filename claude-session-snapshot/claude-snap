@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # claude-snap — Claude Code 원격 제어 세션 장부 · 부팅 복구
 #
-#   save [--final]                   살아 있는 원격 제어 세션을 장부에 반영한다 (5분 타이머 / 종료 직전)
+#   save [--final]                   살아 있는 원격 제어 세션을 장부에 반영한다 (1분 타이머 / 종료 직전)
 #   restore [--from FILE] [--dry-run]
 #                                    장부(또는 FILE)의 세션을 tmux 창마다 `claude --resume` 으로 띄우고
 #                                    원격 연결까지 됐는지 검증한다. FILE 의 항목은 장부에 합친다
@@ -230,11 +230,19 @@ cmd_save() {
 
 # ── restore ─────────────────────────────────────────────
 
+# 복구 진행 상황. status 가 읽어 "대기"가 멈춘 것인지 기다리는 중인지 보여 준다.
+progress() { printf '%s %s %s\n' "$BOOT_ID" "$(date +%T)" "$*" > "$STATE_DIR/progress"; }
+
+# 1초 간격으로 DNS → HTTPS 순서로 본다. 부팅 직후 실패 원인은 DNS(EAI_AGAIN)다.
 wait_network() {
     local i
-    for ((i = 0; i < NET_WAIT_SEC; i += 5)); do
-        curl -s -o /dev/null --max-time 5 https://api.anthropic.com/ && return 0
-        sleep 5
+    for ((i = 0; i < NET_WAIT_SEC; i++)); do
+        if getent hosts api.anthropic.com > /dev/null 2>&1 \
+            && curl -s -o /dev/null --max-time 3 https://api.anthropic.com/; then
+            ((i)) && log INFO "네트워크 준비 (${i}s)"
+            return 0
+        fi
+        sleep 1
     done
     log WARN "네트워크 대기 ${NET_WAIT_SEC}s 초과 — 그대로 진행한다"
 }
@@ -326,6 +334,51 @@ pane_failure() {
     fi
 }
 
+# 항목 하나를 판단하고 띄운다. cmd_restore 의 지역 변수(dry · live_ids · served · launched ·
+# pane_of · bridge_of · errors · n_skip)를 그대로 쓴다.
+restore_one() {
+    local e="$1" id cwd ts name nsrc bridge pane
+    local -a args
+    id="$(jq -r '.sessionId' <<< "$e")"
+    cwd="$(jq -r '.cwd' <<< "$e")"
+    ts="$(jq -r '.tmuxSession // empty' <<< "$e")"
+    name="$(jq -r '.name // empty' <<< "$e")"
+    nsrc="$(jq -r '.nameSource // empty' <<< "$e")"
+    bridge="$(jq -r '.bridgeSessionId // empty' <<< "$e")"
+    mapfile -t args < <(jq -r '.args[]?' <<< "$e")
+
+    if grep -qxF -- "$id" <<< "$live_ids"; then
+        log SKIP "$id ${name:+($name) }이미 떠 있다"; ((n_skip++)); return
+    fi
+    if [[ ! -d "$cwd" ]]; then
+        log FAIL "$id 작업 디렉터리 없음: $cwd"; errors[$id]="no-cwd"; return
+    fi
+    if [[ -z "$(jsonl_of "$id")" ]]; then
+        log FAIL "$id 대화 기록(jsonl) 없음"; errors[$id]="no-transcript"; return
+    fi
+    if [[ -n "$bridge" ]] && grep -qxF -- "$bridge" <<< "$served"; then
+        log SKIP "$id ${name:+($name) }서버가 $bridge 를 맡고 있다"; ((n_skip++)); return
+    fi
+
+    # 원격 제어를 /remote-control 로 켰거나 서버가 띄운 세션이면 플래그가 없다.
+    if ! printf '%s\n' "${args[@]}" | grep -- '^--remote-control' > /dev/null; then
+        args+=(--remote-control)
+        [[ -n "$name" && "$nsrc" != derived ]] && args+=("$name")
+    fi
+    [[ -n "$ts" ]] || ts="$RESTORED_TMUX_SESSION"
+
+    if ((dry)); then
+        log DRY "tmux[$ts] $cwd :: claude --resume $id ${args[*]}"
+        return
+    fi
+    if pane="$(launch "$ts" "${name:-${id:0:8}}" "$cwd" --resume "$id" "${args[@]}")"; then
+        log START "tmux[$ts] $id ${name:+($name)}"
+        launched+=("$id"); pane_of[$id]="$pane"; bridge_of[$id]="$bridge"
+    else
+        log FAIL "$id tmux 기동 실패"; errors[$id]="tmux"
+    fi
+}
+
 # 띄운 세션이 원격 제어까지 연결됐는지 본다.
 check_connected() {
     local id="$1" f pid
@@ -374,61 +427,38 @@ cmd_restore() {
 
     local n
     n="$(jq '.entries | length' <<< "$src")"
-    ((n)) || { log INFO "복구할 항목이 없다"; return 0; }
+    ((n)) || { log INFO "복구할 항목이 없다"; ((dry)) || progress "완료 — 복구할 항목 없음"; return 0; }
+    log INFO "항목 ${n}개"
 
-    if ((!dry)); then wait_network; wait_servers; fi
-
-    local live_ids served
-    live_ids="$(collect_live | jq -r '.[].sessionId')"
-    served="$(server_listed)"
-    log INFO "항목 ${n}개 · 서버가 맡은 세션 $(grep -c . <<< "$served")개"
-
-    local e id cwd ts name nsrc bridge pane
-    local -a args launched=()
+    local live_ids served="" e
+    local -a launched=() later=()
     local -A pane_of=() bridge_of=() errors=()
     local n_skip=0
+
+    ((dry)) || { progress "네트워크 대기"; wait_network; }
+    live_ids="$(collect_live | jq -r '.[].sessionId')"
+
+    # 1단계 — tmux · 수동 출신은 서버가 되살릴 수 없는 세션이라 서버를 기다리지 않고 바로 띄운다.
+    ((dry)) || progress "1단계 복구"
     while IFS= read -r e; do
-        id="$(jq -r '.sessionId' <<< "$e")"
-        cwd="$(jq -r '.cwd' <<< "$e")"
-        ts="$(jq -r '.tmuxSession // empty' <<< "$e")"
-        name="$(jq -r '.name // empty' <<< "$e")"
-        nsrc="$(jq -r '.nameSource // empty' <<< "$e")"
-        bridge="$(jq -r '.bridgeSessionId // empty' <<< "$e")"
-        mapfile -t args < <(jq -r '.args[]?' <<< "$e")
-
-        if grep -qxF -- "$id" <<< "$live_ids"; then
-            log SKIP "$id ${name:+($name) }이미 떠 있다"; ((n_skip++)); continue
+        if [[ "$(jq -r '.origin' <<< "$e")" == server ]] \
+            && ! grep -qxF -- "$(jq -r '.sessionId' <<< "$e")" <<< "$live_ids"; then
+            later+=("$e"); continue
         fi
-        if [[ ! -d "$cwd" ]]; then
-            log FAIL "$id 작업 디렉터리 없음: $cwd"; errors[$id]="no-cwd"; continue
-        fi
-        if [[ -z "$(jsonl_of "$id")" ]]; then
-            log FAIL "$id 대화 기록(jsonl) 없음"; errors[$id]="no-transcript"; continue
-        fi
-        if [[ -n "$bridge" ]] && grep -qxF -- "$bridge" <<< "$served"; then
-            log SKIP "$id ${name:+($name) }서버가 $bridge 를 맡고 있다"; ((n_skip++)); continue
-        fi
-
-        # 원격 제어를 /remote-control 로 켰거나 서버가 띄운 세션이면 플래그가 없다.
-        if ! printf '%s\n' "${args[@]}" | grep -- '^--remote-control' > /dev/null; then
-            args+=(--remote-control)
-            [[ -n "$name" && "$nsrc" != derived ]] && args+=("$name")
-        fi
-        [[ -n "$ts" ]] || ts="$RESTORED_TMUX_SESSION"
-
-        if ((dry)); then
-            log DRY "tmux[$ts] $cwd :: claude --resume $id ${args[*]}"
-            continue
-        fi
-        if pane="$(launch "$ts" "${name:-${id:0:8}}" "$cwd" --resume "$id" "${args[@]}")"; then
-            log START "tmux[$ts] $id ${name:+($name)}"
-            launched+=("$id"); pane_of[$id]="$pane"; bridge_of[$id]="$bridge"
-        else
-            log FAIL "$id tmux 기동 실패"; errors[$id]="tmux"
-        fi
+        restore_one "$e"
     done < <(jq -c '.entries[]' <<< "$src")
 
+    # 2단계 — 서버 출신만, 서버가 스스로 되살렸는지 목록을 확인한 뒤 판단한다.
+    if ((${#later[@]})); then
+        ((dry)) || { progress "2단계 — 서버 대기 (서버 출신 ${#later[@]}개)"; wait_servers; }
+        live_ids="$(collect_live | jq -r '.[].sessionId')"
+        served="$(server_listed)"
+        log INFO "서버 출신 ${#later[@]}개 · 서버가 맡은 세션 $(grep -c . <<< "$served")개"
+        for e in "${later[@]}"; do restore_one "$e"; done
+    fi
+
     ((dry)) && return 0
+    progress "검증 중 (${#launched[@]}개)"
 
     # 검증 — 원격 연결까지 확인되면 성공. claude 가 끝나 버렸거나 제한 시간까지 연결이 안 되면
     # 그 창의 화면을 리포트에 남긴다.
@@ -436,7 +466,7 @@ cmd_restore() {
     local -a exited=()
     local waited=0 still
     while ((${#pending[@]})) && ((waited < VERIFY_WAIT_SEC)); do
-        sleep 5; ((waited += 5))
+        sleep 2; ((waited += 2))
         still=()
         for id in "${pending[@]}"; do
             if check_connected "$id"; then continue; fi
@@ -480,6 +510,7 @@ cmd_restore() {
     fi
 
     log INFO "복구 ${n_ok}개 · 실패 ${#errors[@]}개 · 건너뜀 ${n_skip}개 · 리포트 $REPORT"
+    progress "완료 — 복구 ${n_ok} · 실패 ${#errors[@]} · 건너뜀 ${n_skip} ($(basename "$REPORT"))"
 }
 
 
@@ -552,6 +583,12 @@ cmd_status() {
     [[ -f "$file" ]] || { echo "장부 없음 ($file)"; return 0; }
     live="$(collect_live)"
     echo "장부: $file · 갱신 $(jq -r '.updatedAtIso // .savedAtIso // "-"' "$file")"
+    local pb pt pm
+    if read -r pb pt pm < "$STATE_DIR/progress" 2>/dev/null && [[ "$pb" == "$BOOT_ID" ]]; then
+        echo "이번 부팅 복구: $pt $pm"
+    else
+        echo "이번 부팅 복구: 시작 전"
+    fi
     jq -r --argjson live "$live" --arg boot "$BOOT_ID" '
         ($live | map({(.sessionId): .}) | add // {}) as $L
         | .entries[]

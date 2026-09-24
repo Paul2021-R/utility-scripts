@@ -1,6 +1,6 @@
 ## Claude Code 원격 제어 세션 장부 · 부팅 복구 (systemd user)
 
-Dev PC에서 원격 제어(Remote Control)로 연결된 Claude Code 세션을 장부(`ledger.json`)에 기록한다. 기록 시점은 5분마다, 그리고 시스템 종료 직전이다. 부팅하면 장부의 세션을 tmux 창마다 `claude --resume`으로 다시 띄워 claude.ai / Claude 앱에서 바로 이어 쓸 수 있게 만들고, 원격 연결까지 됐는지 검증해 결과를 리포트로 남긴다. 대상은 이 기기(`~/.claude/sessions/`)의 세션뿐이다.
+Dev PC에서 원격 제어(Remote Control)로 연결된 Claude Code 세션을 장부(`ledger.json`)에 기록한다. 기록 시점은 1분마다, 그리고 시스템 종료 직전이다. 부팅하면 장부의 세션을 tmux 창마다 `claude --resume`으로 다시 띄워 claude.ai / Claude 앱에서 바로 이어 쓸 수 있게 만들고, 원격 연결까지 됐는지 검증해 결과를 리포트로 남긴다. 대상은 이 기기(`~/.claude/sessions/`)의 세션뿐이다.
 
 ### 1. 구성
 
@@ -8,7 +8,7 @@ Dev PC에서 원격 제어(Remote Control)로 연결된 Claude Code 세션을 �
 |:--|:--|:--|
 | `claude-snap` | `~/.local/bin/` | `save` · `restore` · `status` · `add` · `drop` · `history` |
 | `claude-snap.service` | `~/.config/systemd/user/` | 부팅 시 `restore`, 종료 시 `save --final` |
-| `claude-snap-save.service` · `.timer` | `~/.config/systemd/user/` | 5분마다 `save` |
+| `claude-snap-save.service` · `.timer` | `~/.config/systemd/user/` | 1분마다 `save` |
 
 상태 파일은 `~/.local/state/claude-snap/` 아래에 둔다.
 
@@ -48,7 +48,12 @@ systemctl --user enable --now claude-snap.service claude-snap-save.timer
 
 ### 4. 복구
 
-`restore`는 장부(또는 `--from FILE`)의 항목마다 아래 순서로 판단한다. 부팅 시에는 먼저 네트워크를 최대 120초 기다린다. 이어서 원격 제어 서버마다 연결(`Connected`)되고 세션 목록이 10초 동안 바뀌지 않을 때까지 최대 150초 기다린다.
+`restore`는 먼저 네트워크를 1초 간격으로 최대 120초 기다린다(DNS 조회 → HTTPS 순서). 이어서 두 단계로 복구한다.
+
+- **1단계 — tmux · 수동 출신**: 서버가 되살릴 수 없는 세션이라 서버를 기다리지 않고 바로 띄운다.
+- **2단계 — 서버 출신**: 원격 제어 서버마다 연결(`Connected`)되고 세션 목록이 10초 동안 바뀌지 않을 때까지 최대 150초 기다린 뒤 띄운다. 장부에 서버 출신이 없으면 이 단계는 통째로 건너뛴다.
+
+두 단계 모두 항목마다 아래 순서로 판단한다.
 
 1. 같은 `sessionId`가 이미 떠 있으면 건너뛴다.
 2. 작업 디렉터리나 대화 기록이 없으면 실패로 기록한다.
@@ -64,7 +69,7 @@ systemctl --user enable --now claude-snap.service claude-snap-save.timer
 ### 5. 운영
 
 ```sh
-claude-snap status                         # 장부 항목과 상태 (live / 연결끊김 / 대기)
+claude-snap status                         # 장부 항목과 상태 (live / 연결끊김 / 대기) + 이번 부팅 복구 진행 단계
 claude-snap status history/ledger-….json   # 다른 장부 파일 보기
 claude-snap restore --dry-run              # 띄우지 않고 복구 판단만 출력
 claude-snap restore --from FILE            # 지정한 장부의 항목만 복구 (장부에 합친다)
@@ -101,3 +106,4 @@ ls -t ~/.local/state/claude-snap/reports/   # 복구 리포트
 - ⚠️ **이미 떠 있는 tmux 서버가 터미널(Konsole 탭 등)의 스코프에 있으면 복구한 창도 그 서버에 들어간다.** 그 터미널을 닫을 때 스코프가 정리되면 함께 죽을 수 있다. 확인: `cat /proc/$(tmux display -p '#{pid}')/cgroup`.
 - 🚨 **`claude-rc@` 서버가 띄운 세션 안에서 `tmux`를 직접 처음 띄우면 그 tmux 서버가 `claude-rc@*.service`의 cgroup에 들어간다.** 서비스가 재시작되면 tmux 서버와 모든 창이 함께 죽는다. tmux 서버는 `claude-snap` 복구나 로그인 셸에서 처음 뜨게 한다.
 - ⚠️ `~/.claude/sessions/*.json`과 대화 기록 형식은 Claude Code의 문서화되지 않은 내부 형식이다. 업데이트로 필드(`bridgeSessionId` · `procStart` · `tmux` · `permission-mode` · `custom-title` · `bridge-session`)가 바뀌면 저장이 비거나 판정이 틀어진다. `status`의 항목 수가 갑자기 0이 되거나 `events.log`에 이상한 `DROP`이 몰리면 이것부터 확인한다.
+- 🚨 **tmux 안에서 테스트할 때 `TMUX_TMPDIR`로는 격리되지 않는다.** tmux 클라이언트는 `$TMUX`(지금 붙어 있는 서버)를 `TMUX_TMPDIR`보다 먼저 쓰므로, 격리한 줄 알고 실행한 `tmux kill-server`가 실제 서버와 그 안의 모든 세션을 끝낸다. 테스트는 `env -u TMUX tmux -L <전용 소켓>`으로만 하고, `kill-server`는 `-L` 없이 쓰지 않는다.
